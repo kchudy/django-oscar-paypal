@@ -142,7 +142,7 @@ def set_txn(basket, shipping_methods, currency, return_url, cancel_url, update_u
     this request - most are controlled by PAYPAL_* settings.
     """
     params = [
-        ('actionType', 'PAY'),
+        ('actionType', 'CREATE'),
         ('cancelUrl', cancel_url),
         ('currencyCode', currency),
         ('requestEnvelope.errorLanguage', 'en_US'),

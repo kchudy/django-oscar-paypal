@@ -3,15 +3,11 @@ from django.db import models
 
 
 class AdaptiveTransaction(base.ResponseModel):
-
-    # Request info
+    method = models.CharField(max_length=32)
     is_sandbox = models.BooleanField(default=True)
     action = models.CharField(max_length=32)
-    amount = models.DecimalField(
-        max_digits=12, decimal_places=2, null=True, blank=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     currency = models.CharField(max_length=32, null=True, blank=True)
-
-    # Response info
     ack = models.CharField(max_length=32)
 
     # This is PayPal's ID for the transaction.  It should be unique but we

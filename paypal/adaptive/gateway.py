@@ -18,13 +18,27 @@ from django.utils.translation import ugettext_lazy as _
 
 
 # PayPal methods
-SET_EXPRESS_CHECKOUT = 'SetExpressCheckout'
+SET_ADAPTIVE_CHECKOUT = 'CREATE'
+GET_ADAPTIVE_CHECKOUT = 'GET'
 GET_EXPRESS_CHECKOUT = 'GetExpressCheckoutDetails'
 DO_EXPRESS_CHECKOUT = 'DoExpressCheckoutPayment'
 DO_CAPTURE = 'DoCapture'
 DO_VOID = 'DoVoid'
 REFUND_TRANSACTION = 'RefundTransaction'
 SET_CHAINED_PAYMENT = 'SetChainedPayment'
+
+Urls = namedtuple('Urls', 'sandbox production')
+
+URLS = {
+    SET_ADAPTIVE_CHECKOUT: Urls(
+        'https://svcs.sandbox.paypal.com/AdaptivePayments/Pay',
+        'https://svcs.paypal.com/AdaptivePayments/Pay'
+    ),
+    GET_ADAPTIVE_CHECKOUT: Urls(
+        'https://svcs.sandbox.paypal.com/AdaptivePayments/PaymentDetails',
+        'https://svcs.paypal.com/AdaptivePayments/PaymentDetails'
+    )
+}
 
 SALE, AUTHORIZATION, ORDER = 'Sale', 'Authorization', 'Order'
 
@@ -84,51 +98,20 @@ def _post(url, params, headers=None):
     return pairs
 
 
-def _fetch_response(params, currency, amount):
+def _fetch_response(method, params):
     """
     Fetch the response from PayPal and return a transaction object
     """
     # Construct return URL
     if getattr(settings, 'PAYPAL_SANDBOX_MODE', True):
-        url = 'https://svcs.sandbox.paypal.com/AdaptivePayments/Pay'
+        url = URLS[method].sandbox
     else:
-        url = 'https://svcs.paypal.com/AdaptivePayments/Pay'
+        url = URLS[method].production
 
     # Make HTTP request
     pairs = _post(url, params, _get_auth_headers())
 
-    print pairs
-
-    # Record transaction data - we save this model whether the txn
-    # was successful or not
-
-    txn = models.AdaptiveTransaction(
-        ack=pairs['responseEnvelope.ack'],
-        raw_request=pairs['_raw_request'],
-        raw_response=pairs['_raw_response'],
-        response_time=pairs['_response_time'],
-    )
-
-    if txn.is_successful:
-        txn.correlation_id = pairs['responseEnvelope.correlationId']
-        txn.pay_key = pairs['payKey']
-        txn.amount = amount
-        txn.currency = currency
-    else:
-        # There can be more than one error, each with its own number.
-        if 'L_ERRORCODE0' in pairs:
-            txn.error_code = pairs['L_ERRORCODE0']
-        if 'L_LONGMESSAGE0' in pairs:
-            txn.error_message = pairs['L_LONGMESSAGE0']
-
-    txn.save()
-
-    if not txn.is_successful:
-        msg = "Error %s - %s" % (txn.error_code, txn.error_message)
-        logger.error(msg)
-        raise exceptions.PayPalError(msg)
-
-    return txn
+    return pairs
 
 
 def set_txn(basket, shipping_methods, currency, return_url, cancel_url, update_url=None,
@@ -142,7 +125,7 @@ def set_txn(basket, shipping_methods, currency, return_url, cancel_url, update_u
     this request - most are controlled by PAYPAL_* settings.
     """
     params = [
-        ('actionType', 'CREATE'),
+        ('actionType', SET_ADAPTIVE_CHECKOUT),
         ('cancelUrl', cancel_url),
         ('currencyCode', currency),
         ('requestEnvelope.errorLanguage', 'en_US'),
@@ -170,7 +153,32 @@ def set_txn(basket, shipping_methods, currency, return_url, cancel_url, update_u
         params.append(('receiverList.receiver(%d).email' % index, receiver.email))
         params.append(('receiverList.receiver(%d).primary' % index, 'true' if receiver.is_primary else 'false'))
 
-    txn = _fetch_response(params, currency, amount)
+    pairs = _fetch_response(SET_ADAPTIVE_CHECKOUT, params)
+
+    txn = models.AdaptiveTransaction(
+        method=SET_ADAPTIVE_CHECKOUT,
+        ack=pairs['responseEnvelope.ack'],
+        raw_request=pairs['_raw_request'],
+        raw_response=pairs['_raw_response'],
+        response_time=pairs['_response_time'],
+    )
+
+    if txn.is_successful:
+        txn.correlation_id = pairs['responseEnvelope.correlationId']
+        txn.pay_key = pairs['payKey']
+        txn.amount = amount
+        txn.currency = currency
+    else:
+        # TODO Change me
+        txn.error_code = 'example-error-code'
+        txn.error_message = 'example-error-message'
+
+    txn.save()
+
+    if not txn.is_successful:
+        msg = "Error %s - %s" % (txn.error_code, txn.error_message)
+        logger.error(msg)
+        raise exceptions.PayPalError(msg)
 
     if getattr(settings, 'PAYPAL_SANDBOX_MODE', True):
         url = 'https://www.sandbox.paypal.com/webscr'
@@ -180,12 +188,44 @@ def set_txn(basket, shipping_methods, currency, return_url, cancel_url, update_u
     return url + '?cmd=_ap-payment&paykey=%s' % txn.pay_key
 
 
-def get_txn(token):
+def get_txn(payKey):
     """
     Fetch details of a transaction from PayPal using the token as
     an identifier.
     """
-    return _fetch_response(GET_EXPRESS_CHECKOUT, {'TOKEN': token})
+    params = [
+        ('actionType', GET_ADAPTIVE_CHECKOUT),
+        ('payKey', payKey)
+        ('requestEnvelope.errorLanguage', 'en_US'),
+    ]
+
+    pairs = _fetch_response(GET_ADAPTIVE_CHECKOUT, params)
+
+    txn = models.AdaptiveTransaction(
+        method=SET_ADAPTIVE_CHECKOUT,
+        ack=pairs['responseEnvelope.ack'],
+        raw_request=pairs['_raw_request'],
+        raw_response=pairs['_raw_response'],
+        response_time=pairs['_response_time'],
+    )
+
+    if txn.is_successful:
+        txn.correlation_id = pairs['responseEnvelope.correlationId']
+        txn.pay_key = pairs['payKey']
+        txn.currency = pairs['currencyCode']
+    else:
+        # TODO Change me
+        txn.error_code = 'example-error-code'
+        txn.error_message = 'example-error-message'
+
+    txn.save()
+
+    if not txn.is_successful:
+        msg = "Error %s - %s" % (txn.error_code, txn.error_message)
+        logger.error(msg)
+        raise exceptions.PayPalError(msg)
+
+    return txn
 
 
 def do_txn(payer_id, token, amount, currency, action=SALE):

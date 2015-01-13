@@ -39,11 +39,11 @@ def get_paypal_url(basket, shipping_methods, user=None, shipping_address=None,
     if scheme is None:
         use_https = getattr(settings, 'PAYPAL_CALLBACK_HTTPS', True)
         scheme = 'https' if use_https else 'http'
-    return_url = '%s://%s%s' % (
-        scheme, host, reverse('paypal-success-response', kwargs={
+    return_url = '%s://%s%s?pay_key=${payKey}' % (
+        scheme, host, reverse('paypal-success-response-adaptive', kwargs={
             'basket_id': basket.id}))
     cancel_url = '%s://%s%s' % (
-        scheme, host, reverse('paypal-cancel-response', kwargs={
+        scheme, host, reverse('paypal-cancel-response-adaptive', kwargs={
             'basket_id': basket.id}))
 
     # URL for updating shipping methods - we only use this if we have a set of
@@ -52,7 +52,7 @@ def get_paypal_url(basket, shipping_methods, user=None, shipping_address=None,
     if shipping_methods:
         update_url = '%s://%s%s' % (
             scheme, host,
-            reverse('paypal-shipping-options',
+            reverse('paypal-shipping-options-adaptive',
                     kwargs={'basket_id': basket.id}))
 
     # Determine whether a shipping address is required
@@ -83,18 +83,18 @@ def get_paypal_url(basket, shipping_methods, user=None, shipping_address=None,
                    paypal_params=paypal_params)
 
 
-def fetch_transaction_details(token):
+def fetch_transaction_details(pay_key):
     """
     Fetch the completed details about the PayPal transaction.
     """
-    return get_txn(token)
+    return get_txn(pay_key)
 
 
-def confirm_transaction(payer_id, token, amount, currency):
+def confirm_transaction(payer_id, pay_key, amount, currency):
     """
     Confirm the payment action.
     """
-    return do_txn(payer_id, token, amount, currency,
+    return do_txn(payer_id, pay_key, amount, currency,
                   action=_get_payment_action())
 
 

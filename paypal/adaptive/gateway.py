@@ -20,6 +20,7 @@ from django.utils.translation import ugettext_lazy as _
 # PayPal methods
 SET_ADAPTIVE_CHECKOUT = 'CREATE'
 GET_ADAPTIVE_CHECKOUT = 'GET'
+DO_ADAPTIVE_CHECKOUT = 'DO'
 GET_EXPRESS_CHECKOUT = 'GetExpressCheckoutDetails'
 DO_EXPRESS_CHECKOUT = 'DoExpressCheckoutPayment'
 DO_CAPTURE = 'DoCapture'
@@ -37,7 +38,11 @@ URLS = {
     GET_ADAPTIVE_CHECKOUT: Urls(
         'https://svcs.sandbox.paypal.com/AdaptivePayments/PaymentDetails',
         'https://svcs.paypal.com/AdaptivePayments/PaymentDetails'
-    )
+    ),
+    DO_ADAPTIVE_CHECKOUT: Urls(
+        'https://svcs.sandbox.paypal.com/AdaptivePayments/ExecutePayment',
+        'https://svcs.paypal.com/AdaptivePayments/ExecutePayment'
+    ),
 }
 
 SALE, AUTHORIZATION, ORDER = 'Sale', 'Authorization', 'Order'
@@ -188,21 +193,21 @@ def set_txn(basket, shipping_methods, currency, return_url, cancel_url, update_u
     return url + '?cmd=_ap-payment&paykey=%s' % txn.pay_key
 
 
-def get_txn(payKey):
+def get_txn(pay_key):
     """
     Fetch details of a transaction from PayPal using the token as
     an identifier.
     """
     params = [
         ('actionType', GET_ADAPTIVE_CHECKOUT),
-        ('payKey', payKey)
+        ('payKey', pay_key),
         ('requestEnvelope.errorLanguage', 'en_US'),
     ]
 
     pairs = _fetch_response(GET_ADAPTIVE_CHECKOUT, params)
 
     txn = models.AdaptiveTransaction(
-        method=SET_ADAPTIVE_CHECKOUT,
+        method=GET_ADAPTIVE_CHECKOUT,
         ack=pairs['responseEnvelope.ack'],
         raw_request=pairs['_raw_request'],
         raw_response=pairs['_raw_response'],
@@ -229,17 +234,37 @@ def get_txn(payKey):
 
 
 def do_txn(payer_id, token, amount, currency, action=SALE):
-    """
-    DoExpressCheckoutPayment
-    """
-    params = {
-        'PAYERID': payer_id,
-        'TOKEN': token,
-        'PAYMENTREQUEST_0_AMT': amount,
-        'PAYMENTREQUEST_0_CURRENCYCODE': currency,
-        'PAYMENTREQUEST_0_PAYMENTACTION': action,
-    }
-    return _fetch_response(DO_EXPRESS_CHECKOUT, params)
+    params = (
+        ('payKey', token),
+        ('requestEnvelope.errorLanguage', 'en_US'),
+    )
+
+    pairs = _fetch_response(DO_ADAPTIVE_CHECKOUT, params)
+
+    txn = models.AdaptiveTransaction(
+        method=DO_ADAPTIVE_CHECKOUT,
+        ack=pairs['responseEnvelope.ack'],
+        raw_request=pairs['_raw_request'],
+        raw_response=pairs['_raw_response'],
+        response_time=pairs['_response_time'],
+    )
+
+    if txn.is_successful:
+        txn.correlation_id = pairs['responseEnvelope.correlationId']
+        txn.pay_key = pairs['payKey']
+        txn.currency = pairs['currencyCode']
+    else:
+        txn.error_code = txn.value('error(0).errorId')
+        txn.error_message = txn.value('error(0).message')
+
+    txn.save()
+
+    if not txn.is_successful:
+        msg = "Error %s - %s" % (txn.error_code, txn.error_message)
+        logger.error(msg)
+        raise exceptions.PayPalError(msg)
+
+    return txn
 
 
 def do_capture(txn_id, amount, currency, complete_type='Complete',
@@ -294,8 +319,6 @@ def _get_auth_headers():
 
 
 def _get_receivers(amount, commission, partner_email):
-    print 'Settings receivers for %s, %s, %s' % (amount, commission, partner_email)
-
     commission_amount = amount * commission / 100
 
     return [

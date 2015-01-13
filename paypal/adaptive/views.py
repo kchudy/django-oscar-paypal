@@ -28,6 +28,8 @@ from paypal.exceptions import PayPalError
 
 # Load views dynamically
 PaymentDetailsView = get_class('checkout.views', 'PaymentDetailsView')
+ThankYouView = get_class('checkout.views', 'ThankYouView')
+OrderPlacementMixin = get_class('checkout.mixins', 'OrderPlacementMixin')
 CheckoutSessionMixin = get_class('checkout.session', 'CheckoutSessionMixin')
 
 ShippingAddress = get_model('order', 'ShippingAddress')
@@ -156,67 +158,75 @@ class CancelResponseView(RedirectView):
         return reverse('basket:summary')
 
 
-# Upgrading notes: when we drop support for Oscar 0.6, this class can be
-# refactored to pass variables around more explicitly (instead of assigning
-# things to self so they are accessible in a later method).
-class SuccessResponseView(PaymentDetailsView):
-    template_name_preview = 'paypal/express/preview.html'
-    preview = True
-
-    # We don't have the usual pre-conditions (Oscar 0.7+)
-    @property
-    def pre_conditions(self):
-        return [] if oscar.VERSION[:2] >= (0, 8) else ()
-
+class SuccessResponseView(OrderPlacementMixin, ThankYouView):
     def get(self, request, *args, **kwargs):
-        """
-        Fetch details about the successful transaction from PayPal.  We use
-        these details to show a preview of the order with a 'submit' button to
-        place it.
-        """
         try:
-            self.payer_id = request.GET['PayerID']
-            self.token = request.GET['token']
+            self.pay_key = request.GET['pay_key']
         except KeyError:
-            # Manipulation - redirect to basket page with warning message
-            logger.warning("Missing GET params on success response page")
-            messages.error(
-                self.request,
-                _("Unable to determine PayPal transaction details"))
+            # Probably suspicious manipulation if we get here
+            messages.error(self.request, 'Pay key not provided as the request argument')
             return HttpResponseRedirect(reverse('basket:summary'))
 
         try:
-            self.txn = fetch_transaction_details(self.token)
-        except PayPalError as e:
-            logger.warning(
-                "Unable to fetch transaction details for token %s: %s",
-                self.token, e)
-            messages.error(
-                self.request,
-                _("A problem occurred communicating with PayPal - please try again later"))
+            self.txn = fetch_transaction_details(self.pay_key)
+        except PayPalError:
+            # Unable to fetch txn details from PayPal - we have to bail out
+            messages.error(self.request, 'Error occurred while getting transation status from PayPal')
+            return HttpResponseRedirect(reverse('basket:summary'))
+
+        if not self.txn.is_successful or not self.txn.value('status') == 'COMPLETED':
+            messages.error(self.request, 'Transaction status is incomplete')
             return HttpResponseRedirect(reverse('basket:summary'))
 
         # Reload frozen basket which is specified in the URL
-        kwargs['basket'] = self.load_frozen_basket(kwargs['basket_id'])
-        if not kwargs['basket']:
-            logger.warning(
-                "Unable to load frozen basket with ID %s", kwargs['basket_id'])
-            messages.error(
-                self.request,
-                _("No basket was found that corresponds to your "
-                  "PayPal transaction"))
+        basket = self.load_basket(kwargs['basket_id'])
+
+        if not basket:
+            messages.error(self.request, 'Unable to load basket details')
             return HttpResponseRedirect(reverse('basket:summary'))
 
-        logger.info(
-            "Basket #%s - showing preview with payer ID %s and token %s",
-            kwargs['basket'].id, self.payer_id, self.token)
+        # We generate the order number first as this will be used
+        # in payment requests (ie before the order model has been
+        # created).  We also save it in the session for multi-stage
+        # checkouts (eg where we redirect to a 3rd party site and place
+        # the order on a different request).
+        order_number = self.generate_order_number(basket)
+        self.checkout_session.set_order_number(order_number)
+        logger.info("Order #%s: beginning submission process for basket #%d", order_number, basket.id)
+
+        # Freeze the basket so it cannot be manipulated while the customer is
+        # completing payment on a 3rd party site.  Also, store a reference to
+        # the basket in the session so that we know which basket to thaw if we
+        # get an unsuccessful payment response when redirecting to a 3rd party
+        # site.
+        self.freeze_basket(basket)
+        self.checkout_session.set_submitted_basket(basket)
+
+        logger.info("Order #%s: payment successful, placing order", order_number)
+
+        try:
+            submission = self.build_submission(basket=basket)
+            submission['order_number'] = order_number
+            del submission['payment_kwargs']
+            del submission['order_kwargs']
+
+            return self.handle_order_placement(**submission)
+        except Exception as e:
+            # It's possible that something will go wrong while trying to
+            # actually place an order.  Not a good situation to be in as a
+            # payment transaction may already have taken place, but needs
+            # to be handled gracefully.
+            msg = six.text_type(e)
+            logger.error("Order #%s: unable to place order - %s", order_number, msg, exc_info=True)
+            self.restore_frozen_basket()
+            return self.render_preview(self.request, error=msg)
 
         return super(SuccessResponseView, self).get(request, *args, **kwargs)
 
-    def load_frozen_basket(self, basket_id):
+    def load_basket(self, basket_id):
         # Lookup the frozen basket that this txn corresponds to
         try:
-            basket = Basket.objects.get(id=basket_id, status=Basket.FROZEN)
+            basket = Basket.objects.get(id=basket_id)
         except Basket.DoesNotExist:
             return None
 
@@ -229,219 +239,7 @@ class SuccessResponseView(PaymentDetailsView):
 
         return basket
 
-    def get_context_data(self, **kwargs):
-        ctx = super(SuccessResponseView, self).get_context_data(**kwargs)
-
-        if not hasattr(self, 'payer_id'):
-            return ctx
-
-        # This context generation only runs when in preview mode
-        ctx.update({
-            'payer_id': self.payer_id,
-            'token': self.token,
-            'paypal_user_email': self.txn.value('EMAIL'),
-            'paypal_amount': D(self.txn.value('AMT')),
-        })
-
-        return ctx
-
-    def post(self, request, *args, **kwargs):
-        """
-        Place an order.
-
-        We fetch the txn details again and then proceed with oscar's standard
-        payment details view for placing the order.
-        """
-        error_msg = _(
-            "A problem occurred communicating with PayPal "
-            "- please try again later"
-        )
-        try:
-            self.payer_id = request.POST['payer_id']
-            self.token = request.POST['token']
-        except KeyError:
-            # Probably suspicious manipulation if we get here
-            messages.error(self.request, error_msg)
-            return HttpResponseRedirect(reverse('basket:summary'))
-
-        try:
-            self.txn = fetch_transaction_details(self.token)
-        except PayPalError:
-            # Unable to fetch txn details from PayPal - we have to bail out
-            messages.error(self.request, error_msg)
-            return HttpResponseRedirect(reverse('basket:summary'))
-
-        # Reload frozen basket which is specified in the URL
-        basket = self.load_frozen_basket(kwargs['basket_id'])
-        if not basket:
-            messages.error(self.request, error_msg)
-            return HttpResponseRedirect(reverse('basket:summary'))
-
-        submission = self.build_submission(basket=basket)
-        return self.submit(**submission)
-
-    def build_submission(self, **kwargs):
-        submission = super(
-            SuccessResponseView, self).build_submission(**kwargs)
-        # Pass the user email so it can be stored with the order
-        submission['order_kwargs']['guest_email'] = self.txn.value('EMAIL')
-        # Pass PP params
-        submission['payment_kwargs']['payer_id'] = self.payer_id
-        submission['payment_kwargs']['token'] = self.token
-        submission['payment_kwargs']['txn'] = self.txn
-        return submission
-
-    # Warning: This method can be removed when we drop support for Oscar 0.6
-    def get_error_response(self):
-        # We bypass the normal session checks for shipping address and shipping
-        # method as they don't apply here.
-        pass
-
-    def handle_payment(self, order_number, total, **kwargs):
-        """
-        Complete payment with PayPal - this calls the 'DoExpressCheckout'
-        method to capture the money from the initial transaction.
-        """
-        try:
-            confirm_txn = confirm_transaction(
-                kwargs['payer_id'], kwargs['token'], kwargs['txn'].amount,
-                kwargs['txn'].currency)
-        except PayPalError:
-            raise UnableToTakePayment()
-        if not confirm_txn.is_successful:
-            raise UnableToTakePayment()
-
-        # Record payment source and event
-        source_type, is_created = SourceType.objects.get_or_create(
-            name='PayPal')
-        source = Source(source_type=source_type,
-                        currency=confirm_txn.currency,
-                        amount_allocated=confirm_txn.amount,
-                        amount_debited=confirm_txn.amount)
-        self.add_payment_source(source)
-        self.add_payment_event('Settled', confirm_txn.amount,
-                               reference=confirm_txn.correlation_id)
-
-    def get_shipping_address(self, basket):
-        """
-        Return a created shipping address instance, created using
-        the data returned by PayPal.
-        """
-        # Determine names - PayPal uses a single field
-        ship_to_name = self.txn.value('PAYMENTREQUEST_0_SHIPTONAME')
-        if ship_to_name is None:
-            return None
-        first_name = last_name = None
-        parts = ship_to_name.split()
-        if len(parts) == 1:
-            last_name = ship_to_name
-        elif len(parts) > 1:
-            first_name = parts[0]
-            last_name = " ".join(parts[1:])
-        return ShippingAddress(
-            first_name=first_name,
-            last_name=last_name,
-            line1=self.txn.value('PAYMENTREQUEST_0_SHIPTOSTREET'),
-            line2=self.txn.value('PAYMENTREQUEST_0_SHIPTOSTREET2', default=""),
-            line4=self.txn.value('PAYMENTREQUEST_0_SHIPTOCITY', default=""),
-            state=self.txn.value('PAYMENTREQUEST_0_SHIPTOSTATE', default=""),
-            postcode=self.txn.value('PAYMENTREQUEST_0_SHIPTOZIP'),
-            country=Country.objects.get(iso_3166_1_a2=self.txn.value('PAYMENTREQUEST_0_SHIPTOCOUNTRYCODE'))
-        )
-
-    def get_shipping_method(self, basket, shipping_address=None, **kwargs):
-        """
-        Return the shipping method used
-        """
-        if not basket.is_shipping_required():
-            return NoShippingRequired()
-
-        # Instantiate a new FixedPrice shipping method instance
-        charge_incl_tax = D(self.txn.value('PAYMENTREQUEST_0_SHIPPINGAMT'))
-
-        # Assume no tax for now
-        charge_excl_tax = charge_incl_tax
-        method = FixedPrice(charge_excl_tax, charge_incl_tax)
-        name = self.txn.value('SHIPPINGOPTIONNAME')
-
-        if not name:
-            session_method = super(SuccessResponseView, self).get_shipping_method(
-                basket, shipping_address, **kwargs)
-            if session_method:
-                method.name = session_method.name
-        else:
-            method.name = name
-        return method
-
 
 class ShippingOptionsView(View):
-
     def post(self, request, *args, **kwargs):
-        """
-        We use the shipping address given to use by PayPal to
-        determine the available shipping method
-        """
-        # Basket ID is passed within the URL path.  We need to do this as some
-        # shipping options depend on the user and basket contents.  PayPal do
-        # pass back details of the basket contents but it would be royal pain to
-        # reconstitute the basket based on those - easier to just to piggy-back
-        # the basket ID in the callback URL.
-        basket = get_object_or_404(Basket, id=kwargs['basket_id'])
-        user = basket.owner
-        if not user:
-            user = AnonymousUser()
-
-        # Create a shipping address instance using the data passed back
-        country_code = self.request.POST.get(
-            'PAYMENTREQUEST_0_SHIPTOCOUNTRY', None)
-        try:
-            country = Country.objects.get(iso_3166_1_a2=country_code)
-        except Country.DoesNotExist:
-            country = Country()
-
-        shipping_address = ShippingAddress(
-            line1=self.request.POST.get('PAYMENTREQUEST_0_SHIPTOSTREET', None),
-            line2=self.request.POST.get('PAYMENTREQUEST_0_SHIPTOSTREET2', None),
-            line4=self.request.POST.get('PAYMENTREQUEST_0_SHIPTOCITY', None),
-            state=self.request.POST.get('PAYMENTREQUEST_0_SHIPTOSTATE', None),
-            postcode=self.request.POST.get('PAYMENTREQUEST_0_SHIPTOZIP', None),
-            country=country
-        )
-        methods = self.get_shipping_methods(user, basket, shipping_address)
-        return self.render_to_response(methods, basket)
-
-    def render_to_response(self, methods, basket):
-        pairs = [
-            ('METHOD', 'CallbackResponse'),
-            ('CURRENCYCODE', self.request.POST.get('CURRENCYCODE', 'GBP')),
-        ]
-        for index, method in enumerate(methods):
-            if hasattr(method, 'set_basket'):
-                # Oscar < 0.8
-                method.set_basket(basket)
-                charge = method.charge_incl_tax
-            else:
-                cost = method.calculate(basket)
-                charge = cost.incl_tax
-
-            pairs.append(('L_SHIPPINGOPTIONNAME%d' % index,
-                          six.text_type(method.name)))
-            pairs.append(('L_SHIPPINGOPTIONLABEL%d' % index,
-                          six.text_type(method.name)))
-            pairs.append(('L_SHIPPINGOPTIONAMOUNT%d' % index, charge))
-            # For now, we assume tax and insurance to be zero
-            pairs.append(('L_TAXAMT%d' % index, D('0.00')))
-            pairs.append(('L_INSURANCEAMT%d' % index, D('0.00')))
-            # We assume that the first returned method is the default one
-            pairs.append(('L_SHIPPINGOPTIONISDEFAULT%d' % index, 1 if index == 0 else 0))
-        else:
-            # No shipping methods available - we flag this up to PayPal indicating that we
-            # do not ship to the shipping address.
-            pairs.append(('NO_SHIPPING_OPTION_DETAILS', 1))
-        payload = urlencode(pairs)
-        return HttpResponse(payload)
-
-    def get_shipping_methods(self, user, basket, shipping_address):
-        repo = Repository()
-        return repo.get_shipping_methods(
-            user, basket, shipping_addr=shipping_address)
+        raise NotImplementedError('Shipping options view is not implemented yet')

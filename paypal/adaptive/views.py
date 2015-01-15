@@ -60,9 +60,12 @@ class RedirectView(CheckoutSessionMixin, RedirectView):
         try:
             basket = self.request.basket
             url = self._get_redirect_url(basket, **kwargs)
-        except PayPalError:
+        except PayPalError as e:
             messages.error(
                 self.request, _("An error occurred communicating with PayPal"))
+
+            logger.error(_("An error occurred communicating with PayPal"), e)
+
             if self.as_payment_method:
                 url = reverse('checkout:payment-details')
             else:
@@ -95,6 +98,11 @@ class RedirectView(CheckoutSessionMixin, RedirectView):
     def _get_redirect_url(self, basket, **kwargs):
         if basket.is_empty:
             raise EmptyBasketException()
+
+        partners_count = len(set([l.stockrecord.partner.paypal_email for l in basket.lines.all()]))
+
+        if partners_count > 1:
+            raise InvalidBasket(_('Basket contains products from multiple partners'))
 
         params = {
             'basket': basket,

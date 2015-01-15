@@ -53,8 +53,13 @@ API_VERSION = getattr(settings, 'PAYPAL_API_VERSION', '119')
 
 logger = logging.getLogger('paypal.express')
 
-# Custom tuple for submitting receiver information
-Receiver = namedtuple('Receiver', 'email amount is_primary')
+
+class Receiver(object):
+    def __init__(self, email, amount, is_primary):
+        self.email = email
+        self.amount = amount
+        self.is_primary = is_primary
+
 
 def _format_description(description):
     if description:
@@ -151,7 +156,7 @@ def set_txn(basket, shipping_methods, currency, return_url, cancel_url, update_u
         logger.error(msg)
         raise express_exceptions.InvalidBasket(_(msg))
 
-    receivers = _get_receivers(amount, basket.commission, basket.partner.paypal_email)
+    receivers = _get_receivers(basket)
 
     for index, receiver in enumerate(receivers):
         params.append(('receiverList.receiver(%d).amount' % index, str(receiver.amount)))
@@ -318,10 +323,30 @@ def _get_auth_headers():
     }
 
 
-def _get_receivers(amount, commission, partner_email):
-    commission_amount = amount * commission / 100
+def _get_receivers(basket):
+    receivers = dict()
 
-    return [
-        Receiver(email=partner_email, amount=amount, is_primary=True),
-        Receiver(email=settings.PAYPAL_EMAIL, amount=commission_amount, is_primary=False),
-    ]
+    for line in basket.lines.all():
+        partner = line.stockrecord.partner
+        product = line.stockrecord.product
+        price = line.stockrecord.price_excl_tax * line.quantity
+
+        if product.is_commissionable:
+            commission_amount = price * partner.commission / 100
+
+            if settings.PAYPAL_EMAIL in receivers:
+                receivers[settings.PAYPAL_EMAIL].amount += commission_amount
+            else:
+                receivers[settings.PAYPAL_EMAIL] = Receiver(email=settings.PAYPAL_EMAIL, amount=commission_amount, is_primary=False)
+
+            if partner.paypal_email in receivers:
+                receivers[partner.paypal_email].amount += price
+            else:
+                receivers[partner.paypal_email] = Receiver(email=partner.paypal_email, amount=line.stockrecord.price_excl_tax, is_primary=True)
+        else:
+            if partner.paypal_email in receivers:
+                receivers[partner.paypal_email].amount += price
+            else:
+                receivers[partner.paypal_email] = Receiver(email=partner.paypal_email, amount=price, is_primary=False)
+
+    return receivers.values()

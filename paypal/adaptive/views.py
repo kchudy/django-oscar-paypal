@@ -28,7 +28,7 @@ from paypal.exceptions import PayPalError
 
 # Load views dynamically
 PaymentDetailsView = get_class('checkout.views', 'PaymentDetailsView')
-ThankYouView = get_class('checkout.views', 'ThankYouView')
+PlaceOrderView = get_class('checkout.views', 'PlaceOrderView')
 OrderPlacementMixin = get_class('checkout.mixins', 'OrderPlacementMixin')
 CheckoutSessionMixin = get_class('checkout.session', 'CheckoutSessionMixin')
 
@@ -166,7 +166,7 @@ class CancelResponseView(RedirectView):
         return reverse('basket:summary')
 
 
-class SuccessResponseView(OrderPlacementMixin, ThankYouView):
+class SuccessResponseView(PlaceOrderView):
     def get(self, request, *args, **kwargs):
         try:
             self.pay_key = request.GET['pay_key']
@@ -228,8 +228,6 @@ class SuccessResponseView(OrderPlacementMixin, ThankYouView):
             logger.error("Order #%s: unable to place order - %s", order_number, msg, exc_info=True)
             self.restore_frozen_basket()
             return self.render_preview(self.request, error=msg)
-
-        return super(SuccessResponseView, self).get(request, *args, **kwargs)
 
     def load_basket(self, basket_id):
         # Lookup the frozen basket that this txn corresponds to

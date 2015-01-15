@@ -331,7 +331,12 @@ def _get_receivers(basket):
         product = line.stockrecord.product
         price = line.stockrecord.price_excl_tax * line.quantity
 
-        if product.is_commissionable:
+        if product.is_top_up:
+            if partner.paypal_email in receivers:
+                receivers[partner.paypal_email].amount += price
+            else:
+                receivers[partner.paypal_email] = Receiver(email=partner.paypal_email, amount=price, is_primary=False)
+        else:
             commission_amount = price * partner.commission / 100
 
             if settings.PAYPAL_EMAIL in receivers:
@@ -343,10 +348,6 @@ def _get_receivers(basket):
                 receivers[partner.paypal_email].amount += price
             else:
                 receivers[partner.paypal_email] = Receiver(email=partner.paypal_email, amount=line.stockrecord.price_excl_tax, is_primary=True)
-        else:
-            if partner.paypal_email in receivers:
-                receivers[partner.paypal_email].amount += price
-            else:
-                receivers[partner.paypal_email] = Receiver(email=partner.paypal_email, amount=price, is_primary=False)
+
 
     return receivers.values()

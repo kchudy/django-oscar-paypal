@@ -179,9 +179,8 @@ def set_txn(basket, shipping_methods, currency, return_url, cancel_url, update_u
         txn.amount = amount
         txn.currency = currency
     else:
-        # TODO Change me
-        txn.error_code = 'example-error-code'
-        txn.error_message = 'example-error-message'
+        txn.error_code = txn.value('error(0).errorId')
+        txn.error_message = txn.value('error(0).message')
 
     txn.save()
 
@@ -224,9 +223,8 @@ def get_txn(pay_key):
         txn.pay_key = pairs['payKey']
         txn.currency = pairs['currencyCode']
     else:
-        # TODO Change me
-        txn.error_code = 'example-error-code'
-        txn.error_message = 'example-error-message'
+        txn.error_code = txn.value('error(0).errorId')
+        txn.error_message = txn.value('error(0).message')
 
     txn.save()
 
@@ -329,7 +327,7 @@ def _get_receivers(basket):
     for line in basket.lines.all():
         partner = line.stockrecord.partner
         product = line.stockrecord.product
-        price = line.stockrecord.price_excl_tax * line.quantity
+        price = round(line.stockrecord.price_excl_tax * line.quantity, 2)
 
         if product.is_top_up:
             if partner.paypal_email in receivers:
@@ -337,7 +335,7 @@ def _get_receivers(basket):
             else:
                 receivers[partner.paypal_email] = Receiver(email=partner.paypal_email, amount=price, is_primary=False)
         else:
-            commission_amount = price * partner.commission / 100
+            commission_amount = round(price * partner.commission / 100, 2)
 
             if settings.PAYPAL_EMAIL in receivers:
                 receivers[settings.PAYPAL_EMAIL].amount += commission_amount
@@ -347,7 +345,6 @@ def _get_receivers(basket):
             if partner.paypal_email in receivers:
                 receivers[partner.paypal_email].amount += price
             else:
-                receivers[partner.paypal_email] = Receiver(email=partner.paypal_email, amount=line.stockrecord.price_excl_tax, is_primary=True)
-
+                receivers[partner.paypal_email] = Receiver(email=partner.paypal_email, amount=price, is_primary=True)
 
     return receivers.values()
